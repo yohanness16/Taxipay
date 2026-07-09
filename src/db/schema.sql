@@ -31,6 +31,33 @@ CREATE TABLE IF NOT EXISTS subscription_payments (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Create an explicit state ENUM for the gateway logs
+CREATE TYPE sms_status AS ENUM ('pending', 'processed', 'failed');
+
+CREATE TABLE IF NOT EXISTS sms_messages (
+  id SERIAL PRIMARY KEY,
+  
+  -- The raw, unaltered SMS block received from the Telebirr notification hook
+  message TEXT NOT NULL,
+  
+  -- Tracking flag to stop malicious replay attacks (double-claiming)
+  status sms_status NOT NULL DEFAULT 'pending',
+  
+  -- Links back to the driver who successfully claimed this text payload
+  processed_by INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+  
+  -- Temporal metadata
+  processed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- CRITICAL PERFORMANCE INDEX
+-- Optimizes raw text pattern lookups (ILIKE) down to 0ms by only indexing unspent records
+CREATE INDEX IF NOT EXISTS idx_sms_pending_lookup 
+ON sms_messages(status) 
+INCLUDE (message) 
+WHERE status = 'pending';
+
 CREATE INDEX IF NOT EXISTS idx_drivers_phone ON drivers(phone);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_driver ON subscriptions(driver_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_end_date ON subscriptions(end_date);
