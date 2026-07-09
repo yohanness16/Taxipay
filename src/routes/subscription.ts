@@ -9,6 +9,7 @@ import type { PoolClient } from "pg";
 const subscription = new Hono<AuthEnv>();
 
 // 1. GET /api/subscription/check/:phone — public, used by the app on launch/offline-sync
+
 subscription.get("/subscription/check/:phone", async (c) => {
   const phone = c.req.param("phone");
   const phoneCheck = phoneSchema.safeParse(phone);
@@ -240,6 +241,75 @@ subscription.post("/subscription/create", authMiddleware, async (c) => {
   );
 
   return c.json({ success: true, subscriptionId: result[0].id, expires: trialEnd.toISOString() }, 201);
+});
+
+
+
+// POST /api/subscription/sms-webhook — PUBLIC/SECURE gateway listener endpoint
+// Ported from your Bingo system to Hono + TypeScript + PostgreSQL
+subscription.post("/subscription/sms-webhook", async (c) => {
+  try {
+    // 1. Secure check using a header token if your gateway app supports it
+    const apiKey = c.req.header("X-Gateway-API-Key");
+    if (process.env.SMS_GATEWAY_SECRET && apiKey !== process.env.SMS_GATEWAY_SECRET) {
+      return c.json({ error: "Unauthorized gateway request" }, 401);
+    }
+
+    // 2. Parse the body safely in Hono
+    const body = await c.req.json().catch(() => null);
+    if (!body) {
+      return c.json({ message: "Invalid or empty JSON payload." }, 400);
+    }
+
+    console.log("📩 Incoming Telebirr Webhook:", body);
+
+    let from = "";
+    let message = "";
+    let sent_timestamp = body.time || body.sent_timestamp;
+
+    // 3. Auto-detect custom multi-line payload format from your old setup
+    if (body.key) {
+      const parts: string[] = body.key.split('\n');
+      if (parts.length > 0) {
+        from = parts[0].replace(/From\s*:\s*/, '').trim();
+        // Joins all remaining lines to preserve formatting
+        message = parts.slice(1).join('\n').trim();
+      }
+    } else {
+      // Standard structural key mapping
+      from = body.from || body.sender || body.address || body.phone || "";
+      message = body.message || body.content || body.body || body.text || "";
+    }
+
+    // 4. Input Constraints Validation
+    if (!from || !message) {
+      console.error("❌ Invalid payload architecture:", body);
+      return c.json({ message: "Invalid payload: Missing from or message context." }, 400);
+    }
+
+    // 5. Telebirr Sender Filter Guard
+    // Blocks normal user text spam from entering your subscription pool
+    const isFromTelebirr = from.toLowerCase().includes("telebirr") || from.includes("8558");
+    if (!isFromTelebirr) {
+      return c.json({ success: false, message: "Ignored: Sender is not Telebirr official channel." }, 200);
+    }
+
+    // 6. Execute direct PostgreSQL insertion via your pool client wrapper
+    // The enum status sets automatically to 'pending'
+    await query(
+      `INSERT INTO sms_messages (message, status, created_at) 
+       VALUES ($1, 'pending', NOW())`,
+      [message]
+    );
+
+    console.log(`✅ Telebirr SMS payload successfully staged into 'sms_messages' pool.`);
+
+    return c.json({ message: "SMS received and stored successfully" }, 201);
+
+  } catch (error) {
+    console.error("❌ Critical Error processing incoming SMS webhook:", error);
+    return c.json({ message: "Internal Server Error" }, 500);
+  }
 });
 
 export default subscription;
