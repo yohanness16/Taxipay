@@ -1,11 +1,14 @@
+// routes/subscriptionRoutes.ts
 import { Hono } from "hono";
-import { query } from "../db/client.js";
-import { authMiddleware, type JwtPayload, type AuthEnv } from "../middleware/auth.js";
+import { query, getPool } from "../db/client.js";
+import { authMiddleware, type AuthEnv } from "../middleware/auth.js";
 import { paymentSchema, phoneSchema } from "../utils/validators.js";
+import { extractTelebirrTxId, findMatchingSms } from "../utils/paymentVerifier.js";
+import type { PoolClient } from "pg";
 
 const subscription = new Hono<AuthEnv>();
 
-// GET /api/subscription/check/:phone — public, used by the app on launch/offline-sync
+// 1. GET /api/subscription/check/:phone — public, used by the app on launch/offline-sync
 subscription.get("/subscription/check/:phone", async (c) => {
   const phone = c.req.param("phone");
   const phoneCheck = phoneSchema.safeParse(phone);
@@ -44,9 +47,7 @@ subscription.get("/subscription/check/:phone", async (c) => {
   });
 });
 
-// POST /api/subscription/payment — public endpoint, called after a successful
-// Stripe (or other gateway) charge to record the 100 ETB monthly payment and
-// extend/renew the subscription.
+// 2. POST /api/subscription/payment — Existing Stripe (or other payment) endpoint
 subscription.post("/subscription/payment", async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = paymentSchema.safeParse(body);
@@ -66,7 +67,6 @@ subscription.post("/subscription/payment", async (c) => {
     return c.json({ error: "This transaction has already been recorded" }, 409);
   }
 
-  // Extend from the later of (now) or (current subscription end date) by 30 days
   const currentSub = await query<{ end_date: string }>(
     `SELECT end_date FROM subscriptions WHERE driver_id = $1 ORDER BY end_date DESC LIMIT 1`,
     [driverId]
@@ -93,8 +93,140 @@ subscription.post("/subscription/payment", async (c) => {
   return c.json({ success: true, paid: true, expires: newEnd.toISOString() }, 201);
 });
 
-// POST /api/subscription/create — JWT-protected, used by the app to explicitly
-// (re)initialize a subscription record for the authenticated driver.
+// 3. NEW: POST /api/subscription/verify-telebirr — public endpoint used by drivers claiming pasted SMS text
+subscription.post("/subscription/verify-telebirr", async (c) => {
+  let body: { driverId: number; amount: number; smsText: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ success: false, message: "Invalid JSON payload." }, 400);
+  }
+
+  const { driverId, amount, smsText } = body;
+  if (!driverId || !amount || !smsText) {
+    return c.json({ success: false, message: "Missing required fields." }, 400);
+  }
+
+  const parsedAmount = parseFloat(amount as any);
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    return c.json({ success: false, message: "Invalid payment amount." }, 400);
+  }
+
+  // A. Extract Telebirr reference from text input
+  const transactionId = extractTelebirrTxId(smsText);
+  if (!transactionId) {
+    return c.json({ success: false, message: "No valid Telebirr transaction code found in text." }, 422);
+  }
+
+  // B. Locate unspent gateway notification SMS record
+  const matchingSms = await findMatchingSms(transactionId, parsedAmount);
+  if (!matchingSms) {
+    return c.json({ success: false, message: "No matching or unspent payment notification found." }, 404);
+  }
+
+  const pool = getPool();
+  const client: PoolClient = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // C. Concurrency Row Lock: Stop duplicate processing requests mid-flight
+    const smsLockSql = 'SELECT status FROM sms_messages WHERE id = $1 FOR UPDATE';
+    const smsLockRes = await client.query<{ status: string }>(smsLockSql, [matchingSms.id]);
+    
+    if (smsLockRes.rows.length === 0 || smsLockRes.rows[0].status !== 'pending') {
+      await client.query("ROLLBACK");
+      return c.json({ success: false, message: "This transaction has already been claimed." }, 409);
+    }
+
+    // D. Fetch and lock latest existing subscription state
+    const subLockSql = `
+        SELECT id, end_date, status FROM subscriptions 
+        WHERE driver_id = $1 
+        ORDER BY end_date DESC LIMIT 1 FOR UPDATE
+    `;
+    const subLockRes = await client.query<{ id: number; end_date: string; status: string }>(subLockSql, [driverId]);
+
+    let startDate: Date = new Date();
+    let currentEndDate: Date | null = null;
+    let subscriptionId: number | null = null;
+
+    if (subLockRes.rows.length > 0) {
+      subscriptionId = subLockRes.rows[0].id;
+      currentEndDate = new Date(subLockRes.rows[0].end_date);
+      
+      // Extend future date if current plan is active; otherwise start renewal from NOW
+      if (currentEndDate > new Date()) {
+        startDate = currentEndDate;
+      }
+    }
+
+    const newEndDate = new Date(startDate.getTime());
+    newEndDate.setDate(newEndDate.getDate() + 30);
+
+    if (subscriptionId !== null) {
+      // Update running timeline record 
+      const updateSubSql = `
+          UPDATE subscriptions 
+          SET end_date = $1, status = 'active', transaction_id = $2, payment_method = 'Telebirr' 
+          WHERE id = $3
+      `;
+      await client.query(updateSubSql, [newEndDate.toISOString(), transactionId, subscriptionId]);
+    } else {
+      // Create initial timeline tier record row
+      const insertSubSql = `
+          INSERT INTO subscriptions (driver_id, start_date, end_date, amount, payment_method, transaction_id, status)
+          VALUES ($1, NOW(), $2, $3, 'Telebirr', $4, 'active') RETURNING id
+      `;
+      const newSubRes = await client.query<{ id: number }>(insertSubSql, [driverId, newEndDate.toISOString(), parsedAmount, transactionId]);
+      subscriptionId = newSubRes.rows[0].id;
+    }
+
+    // E. Anti-fraud safety double check on the historical invoices log ledger
+    const paymentCheckSql = 'SELECT id FROM subscription_payments WHERE transaction_id = $1';
+    const paymentCheckRes = await client.query(paymentCheckSql, [transactionId]);
+    if (paymentCheckRes.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return c.json({ success: false, message: "Duplicate payment record detected." }, 409);
+    }
+
+    // Insert permanent completed transaction log invoice receipt
+    const insertPaymentSql = `
+        INSERT INTO subscription_payments (driver_id, subscription_id, transaction_id, amount, status)
+        VALUES ($1, $2, $3, $4, 'completed')
+    `;
+    await client.query(insertPaymentSql, [driverId, subscriptionId, transactionId, parsedAmount]);
+
+    // F. Mark incoming message spent to close transaction loop lifecycle
+    const updateSmsSql = `
+        UPDATE sms_messages 
+        SET status = 'processed', processed_by = $1, processed_at = NOW() 
+        WHERE id = $2
+    `;
+    await client.query(updateSmsSql, [driverId, matchingSms.id]);
+
+    await client.query("COMMIT");
+
+    return c.json({
+      success: true,
+      message: "Subscription payment verified and access extended successfully.",
+      data: {
+        subscriptionId,
+        extendedUntil: newEndDate.toISOString(),
+        transactionId
+      }
+    }, 200);
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Critical Exception in Telebirr Hono Engine Transaction:", error);
+    return c.json({ success: false, message: "Internal processing engine failure." }, 500);
+  } finally {
+    client.release();
+  }
+});
+
+// 4. POST /api/subscription/create — JWT-protected, explicitly (re)initialize trial
 subscription.post("/subscription/create", authMiddleware, async (c) => {
   const driver = c.get("driver");
 
