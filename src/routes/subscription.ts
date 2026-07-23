@@ -306,10 +306,16 @@ subscription.post("/subscription/sms-webhook", async (c) => {
 
     return c.json({ message: "SMS received and stored successfully" }, 201);
 
-  } catch (error) {
-    console.error("❌ Critical Error processing incoming SMS webhook:", error);
-    return c.json({ message: "Internal Server Error" }, 500);
-  }
+  }catch (error) {
+  console.error("❌ Critical Error:", error);
+
+  return c.json(
+    {
+      message: error instanceof Error ? error.message : String(error)
+    },
+    500
+  );
+}
 });
 
 export default subscription;
