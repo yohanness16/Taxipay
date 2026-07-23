@@ -104,23 +104,27 @@ subscription.post("/subscription/verify-telebirr", async (c) => {
   }
 
   const { driverId, amount, smsText } = body;
+  console.log(`🔍 Received Telebirr verification request for driverId ${driverId} with amount ${amount} and SMS text:`, smsText);
   if (!driverId || !amount || !smsText) {
     return c.json({ success: false, message: "Missing required fields." }, 400);
   }
 
   const parsedAmount = parseFloat(amount as any);
+  console.log(`🔍 Received Telebirr verification request for driverId ${driverId} with amount ${parsedAmount} and SMS text:`, smsText);
   if (isNaN(parsedAmount) || parsedAmount <= 0) {
     return c.json({ success: false, message: "Invalid payment amount." }, 400);
   }
 
   // A. Extract Telebirr reference from text input
   const transactionId = extractTelebirrTxId(smsText);
+  console.log(`🔍 Extracted Telebirr Transaction ID from SMS:`, transactionId);
   if (!transactionId) {
     return c.json({ success: false, message: "No valid Telebirr transaction code found in text." }, 422);
   }
 
   // B. Locate unspent gateway notification SMS record
   const matchingSms = await findMatchingSms(transactionId, parsedAmount);
+  console.log(`🔍 Matching SMS search for TxID ${transactionId} and amount ${parsedAmount}:`, matchingSms);
   if (!matchingSms) {
     return c.json({ success: false, message: "No matching or unspent payment notification found." }, 403);
   }
