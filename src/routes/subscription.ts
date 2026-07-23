@@ -289,7 +289,7 @@ subscription.post("/subscription/sms-webhook", async (c) => {
 
     // 5. Telebirr Sender Filter Guard
     // Blocks normal user text spam from entering your subscription pool
-    const isFromTelebirr = from.toLowerCase().includes("telebirr") || from.includes("8558");
+   const isFromTelebirr = from.toLowerCase().includes("telebirr") || from === "127";
     if (!isFromTelebirr) {
       return c.json({ success: false, message: "Ignored: Sender is not Telebirr official channel." }, 200);
     }
