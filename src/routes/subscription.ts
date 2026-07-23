@@ -122,7 +122,7 @@ subscription.post("/subscription/verify-telebirr", async (c) => {
   // B. Locate unspent gateway notification SMS record
   const matchingSms = await findMatchingSms(transactionId, parsedAmount);
   if (!matchingSms) {
-    return c.json({ success: false, message: "No matching or unspent payment notification found." }, 404);
+    return c.json({ success: false, message: "No matching or unspent payment notification found." }, 403);
   }
 
   const pool = getPool();
