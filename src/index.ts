@@ -16,18 +16,56 @@ app.use("/*", cors({
   allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 }));
 
-// These will now map perfectly to /api/health, /api/subscription/sms-webhook, etc.
+// Base health endpoints
+app.get("/", (c) => c.json({ status: "ok", service: "telebirr-driver-backend" }));
+app.get("/health", (c) => c.json({ status: "ok", service: "telebirr-driver-backend" }));
 app.get("/api/health", (c) => c.json({ status: "ok", service: "telebirr-driver-backend" }));
 
+// Route under both root and /api prefixes
+app.route("/", register);
 app.route("/api", register);
+app.route("/", subscription);
 app.route("/api", subscription);
 
-app.notFound((c) => c.json({ error: "Not found" }, 404));
+// Fallback in case Vercel rewrites directly to the file path
+app.route("/src/index.ts", register);
+app.route("/src/index.ts", subscription);
+app.get("/src/index.ts/health", (c) => c.json({ status: "ok", service: "telebirr-driver-backend" }));
+app.get("/src/index.ts", (c) => c.json({ status: "ok", service: "telebirr-driver-backend" }));
+
+app.notFound((c) => c.json({
+  error: "Not found",
+  path: c.req.path,
+  url: c.req.url,
+  matchedPath: c.req.header("x-matched-path"),
+  method: c.req.method,
+}, 404));
 
 app.onError((err, c) => {
   console.error(err);
   return c.json({ error: "Internal server error" }, 500);
 });
+
+// Intercept app.fetch to restore original URL if rewritten by Vercel
+const originalFetch = app.fetch.bind(app);
+const customFetch = (req: Request, env?: any, executionCtx?: any) => {
+  const matchedPath = req.headers.get("x-matched-path");
+  if (matchedPath) {
+    try {
+      const url = new URL(req.url);
+      if (url.pathname !== matchedPath) {
+        url.pathname = matchedPath;
+        const newReq = new Request(url.toString(), req);
+        return originalFetch(newReq, env, executionCtx);
+      }
+    } catch {
+      // ignore URL parsing error
+    }
+  }
+  return originalFetch(req, env, executionCtx);
+};
+
+app.fetch = customFetch as any;
 
 export default app;
 
