@@ -11,7 +11,10 @@ const subscription = new Hono<AuthEnv>();
 // 1. GET /api/subscription/check/:phone — public, used by the app on launch/offline-sync
 
 subscription.get("/subscription/check/:phone", async (c) => {
-  const phone = c.req.param("phone");
+  const rawParam = c.req.param("phone") ?? "";
+  const decoded = decodeURIComponent(rawParam).trim();
+  const phone = decoded.startsWith("+") ? decoded : `+${decoded.replace(/^\+*/, "")}`;
+
   const phoneCheck = phoneSchema.safeParse(phone);
   if (!phoneCheck.success) {
     return c.json({ error: "Invalid phone number" }, 400);
@@ -39,17 +42,19 @@ subscription.get("/subscription/check/:phone", async (c) => {
   graceEnd.setDate(graceEnd.getDate() + 3);
 
   const paid = now <= graceEnd;
+  const computedStatus = !paid ? "expired" : sub.status;
 
   return c.json({
     paid,
     expires: sub.end_date,
-    status: sub.status,
+    status: computedStatus,
     inGracePeriod: now > endDate && now <= graceEnd,
   });
 });
 
-// 2. POST /api/subscription/payment — Existing Stripe (or other payment) endpoint
-subscription.post("/subscription/payment", async (c) => {
+// 2. POST /api/subscription/payment — Protected payment endpoint
+subscription.post("/subscription/payment", authMiddleware, async (c) => {
+  const authDriver = c.get("driver");
   const body = await c.req.json().catch(() => null);
   const parsed = paymentSchema.safeParse(body);
   if (!parsed.success) {
@@ -58,8 +63,8 @@ subscription.post("/subscription/payment", async (c) => {
   const { phone, transaction_id, amount, status } = parsed.data;
 
   const driverRows = await query<{ id: number }>("SELECT id FROM drivers WHERE phone = $1", [phone]);
-  if (driverRows.length === 0) {
-    return c.json({ error: "Driver not found" }, 404);
+  if (driverRows.length === 0 || driverRows[0].id !== authDriver.driverId) {
+    return c.json({ error: "Driver not found or does not match authenticated user" }, 404);
   }
   const driverId = driverRows[0].id;
 
@@ -94,37 +99,51 @@ subscription.post("/subscription/payment", async (c) => {
   return c.json({ success: true, paid: true, expires: newEnd.toISOString() }, 201);
 });
 
-// 3. NEW: POST /api/subscription/verify-telebirr — public endpoint used by drivers claiming pasted SMS text
-subscription.post("/subscription/verify-telebirr", async (c) => {
-  let body: { driverId: number; amount: number; smsText: string };
+// 3. POST /api/subscription/verify-telebirr — JWT-protected endpoint used by drivers claiming pasted SMS or TxID
+subscription.post("/subscription/verify-telebirr", authMiddleware, async (c) => {
+  const authDriver = c.get("driver");
+  let body: { driverId?: number; amount: number; smsText: string };
   try {
     body = await c.req.json();
   } catch {
     return c.json({ success: false, message: "Invalid JSON payload." }, 400);
   }
 
-  const { driverId, amount, smsText } = body;
-  console.log(`🔍 Received Telebirr verification request for driverId ${driverId} with amount ${amount} and SMS text:`, smsText);
-  if (!driverId || !amount || !smsText) {
-    return c.json({ success: false, message: "Missing required fields." }, 400);
+  const { amount, smsText } = body;
+  const driverId = authDriver.driverId;
+
+  if (!amount || !smsText) {
+    return c.json({ success: false, message: "Missing required fields (amount, smsText)." }, 400);
   }
 
   const parsedAmount = parseFloat(amount as any);
-  console.log(`🔍 Received Telebirr verification request for driverId ${driverId} with amount ${parsedAmount} and SMS text:`, smsText);
   if (isNaN(parsedAmount) || parsedAmount <= 0) {
     return c.json({ success: false, message: "Invalid payment amount." }, 400);
   }
 
-  // A. Extract Telebirr reference from text input
+  // Enforce minimum required subscription fee (defaults to 100 ETB)
+  const minRequiredFee = Number(process.env.SUBSCRIPTION_FEE_ETB ?? 100);
+  if (parsedAmount < minRequiredFee) {
+    return c.json({
+      success: false,
+      message: `Payment amount (${parsedAmount} ETB) is less than required subscription fee of ${minRequiredFee} ETB.`,
+    }, 400);
+  }
+
+  // Verify driver exists
+  const driverCheck = await query("SELECT id FROM drivers WHERE id = $1", [driverId]);
+  if (driverCheck.length === 0) {
+    return c.json({ success: false, message: "Driver account not found." }, 404);
+  }
+
+  // A. Extract Telebirr reference from text input or direct code
   const transactionId = extractTelebirrTxId(smsText);
-  console.log(`🔍 Extracted Telebirr Transaction ID from SMS:`, transactionId);
   if (!transactionId) {
     return c.json({ success: false, message: "No valid Telebirr transaction code found in text." }, 422);
   }
 
   // B. Locate unspent gateway notification SMS record
   const matchingSms = await findMatchingSms(transactionId, parsedAmount);
-  console.log(`🔍 Matching SMS search for TxID ${transactionId} and amount ${parsedAmount}:`, matchingSms);
   if (!matchingSms) {
     return c.json({ success: false, message: "No matching or unspent payment notification found." }, 403);
   }
@@ -223,7 +242,11 @@ subscription.post("/subscription/verify-telebirr", async (c) => {
     }, 200);
 
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rbErr) {
+      console.error("Error during transaction rollback:", rbErr);
+    }
     console.error("Critical Exception in Telebirr Hono Engine Transaction:", error);
     return c.json({ success: false, message: "Internal processing engine failure." }, 500);
   } finally {
@@ -247,10 +270,7 @@ subscription.post("/subscription/create", authMiddleware, async (c) => {
   return c.json({ success: true, subscriptionId: result[0].id, expires: trialEnd.toISOString() }, 201);
 });
 
-
-
 // POST /api/subscription/sms-webhook — PUBLIC/SECURE gateway listener endpoint
-// Ported from your Bingo system to Hono + TypeScript + PostgreSQL
 subscription.post("/subscription/sms-webhook", async (c) => {
   try {
     // 1. Secure check using a header token if your gateway app supports it
@@ -265,24 +285,20 @@ subscription.post("/subscription/sms-webhook", async (c) => {
       return c.json({ message: "Invalid or empty JSON payload." }, 400);
     }
 
-    console.log("📩 Incoming Telebirr Webhook:", body);
-
     let from = "";
     let message = "";
-    let sent_timestamp = body.time || body.sent_timestamp;
 
-    // 3. Auto-detect custom multi-line payload format from your old setup
+    // 3. Auto-detect custom multi-line payload format from SMS forwarders
     if (body.key) {
       const parts: string[] = body.key.split('\n');
       if (parts.length > 0) {
         from = parts[0].replace(/From\s*:\s*/, '').trim();
-        // Joins all remaining lines to preserve formatting
         message = parts.slice(1).join('\n').trim();
       }
     } else {
       // Standard structural key mapping
-      from = body.from || body.sender || body.address || body.phone || "";
-      message = body.message || body.content || body.body || body.text || "";
+      from = (body.from || body.sender || body.address || body.phone || "").toString();
+      message = (body.message || body.content || body.body || body.text || "").toString();
     }
 
     // 4. Input Constraints Validation
@@ -292,14 +308,23 @@ subscription.post("/subscription/sms-webhook", async (c) => {
     }
 
     // 5. Telebirr Sender Filter Guard
-    // Blocks normal user text spam from entering your subscription pool
-   const isFromTelebirr = from.toLowerCase().includes("telebirr") || from === "127";
+    // Supports "127", "+251127", "8558", and "telebirr" sender formats
+    const cleanFrom = from.trim().toLowerCase();
+    const isFromTelebirr = cleanFrom.includes("telebirr") || cleanFrom.includes("127") || cleanFrom.includes("8558");
     if (!isFromTelebirr) {
       return c.json({ success: false, message: "Ignored: Sender is not Telebirr official channel." }, 200);
     }
 
-    // 6. Execute direct PostgreSQL insertion via your pool client wrapper
-    // The enum status sets automatically to 'pending'
+    // 6. Deduplication check: Avoid multiple pending records for identical payload retries
+    const existingPending = await query(
+      "SELECT id FROM sms_messages WHERE message = $1 AND status = 'pending' LIMIT 1",
+      [message]
+    );
+    if (existingPending.length > 0) {
+      return c.json({ message: "SMS already staged and pending." }, 200);
+    }
+
+    // 7. Execute direct PostgreSQL insertion via pool client wrapper
     await query(
       `INSERT INTO sms_messages (message, status, created_at) 
        VALUES ($1, 'pending', NOW())`,
@@ -310,16 +335,15 @@ subscription.post("/subscription/sms-webhook", async (c) => {
 
     return c.json({ message: "SMS received and stored successfully" }, 201);
 
-  }catch (error) {
-  console.error("❌ Critical Error:", error);
-
-  return c.json(
-    {
-      message: error instanceof Error ? error.message : String(error)
-    },
-    500
-  );
-}
+  } catch (error) {
+    console.error("❌ Critical Error in sms-webhook:", error);
+    return c.json(
+      {
+        message: error instanceof Error ? error.message : String(error)
+      },
+      500
+    );
+  }
 });
 
 export default subscription;
