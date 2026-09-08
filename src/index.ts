@@ -49,18 +49,18 @@ app.onError((err, c) => {
 // Intercept app.fetch to restore original URL if rewritten by Vercel
 const originalFetch = app.fetch.bind(app);
 const customFetch = (req: Request, env?: any, executionCtx?: any) => {
-  const matchedPath = req.headers.get("x-matched-path");
-  if (matchedPath) {
-    try {
-      const url = new URL(req.url);
-      if (url.pathname !== matchedPath) {
-        url.pathname = matchedPath;
-        const newReq = new Request(url.toString(), req);
-        return originalFetch(newReq, env, executionCtx);
-      }
-    } catch {
-      // ignore URL parsing error
+  try {
+    const url = new URL(req.url);
+    const pathParam = url.searchParams.get("path") || req.headers.get("x-matched-path");
+    if (pathParam) {
+      const cleanPath = pathParam.startsWith("/") ? pathParam : "/" + pathParam;
+      url.pathname = cleanPath;
+      url.searchParams.delete("path");
+      const newReq = new Request(url.toString(), req);
+      return originalFetch(newReq, env, executionCtx);
     }
+  } catch {
+    // ignore URL parsing error
   }
   return originalFetch(req, env, executionCtx);
 };

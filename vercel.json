@@ -1,7 +1,7 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/src/index.ts" },
-    { "source": "/(.*)", "destination": "/src/index.ts" }
+    { "source": "/api/:path*", "destination": "/src/index.ts?path=:path*" },
+    { "source": "/:path*", "destination": "/src/index.ts?path=:path*" }
   ]
 }
